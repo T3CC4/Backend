@@ -1,0 +1,19 @@
+{
+  "mainServer": {
+    "host": "45.131.109.191",
+    "port": 80,
+    "protocol": "http"
+  },
+  "authentication": {
+    "clientSecret": "86a4447d7bd5ad7c7d680d24c9989712fb0bbf9dd1389af8b644e5f69441998b"
+  },
+  "settings": {
+    "heartbeatInterval": 30000,
+    "commandTimeout": 300000,
+    "maxConcurrentCommands": 3,
+    "logLevel": "info",
+    "autoReconnect": true,
+    "reconnectDelay": 5000
+  },
+  "clientId": "undefined-87652516a6407f22"
+}
